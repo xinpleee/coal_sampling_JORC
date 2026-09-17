@@ -1,7 +1,10 @@
 """Coal geology automatic sampling engine.
 
-The engine is deliberately independent from tkinter so it can be tested and used
+The engine is intentionally independent from tkinter so it can be tested and used
 from scripts. It never writes to the input workbook.
+
+The implementation follows the V1.0 requirement ordering more closely than the
+initial prototype, while preserving the public API used by the GUI and scripts.
 """
 from __future__ import annotations
 
@@ -53,6 +56,8 @@ class Record:
     coal_group: str = ""
     issue: str = ""
     sampled: bool = False
+    selected_special: bool = False
+    selected_thin_coal: bool = False
 
     @property
     def valid_depth(self):
@@ -61,6 +66,9 @@ class Record:
     @property
     def thickness(self):
         return self.calculated or Decimal(0)
+
+    def key(self) -> str:
+        return f"{self.source_sheet}:{self.source_row}"
 
 
 @dataclass
@@ -95,7 +103,8 @@ def normalize_lithology(value: Any) -> str:
     text = "" if value is None else str(value).strip().upper()
     for dash in ("－", "—", "–", "−", "﹣"):
         text = text.replace(dash, "-")
-    return "".join(text.split())
+    text = "".join(text.split())
+    return text.replace(" ", "")
 
 
 class SamplingEngine:
@@ -196,6 +205,12 @@ class SamplingEngine:
             return "ORDINARY_THIN" if r.thickness <= self.params.ordinary_max else "ORDINARY"
         return "SPECIAL"
 
+    def _apply_manual_selection(self, rs):
+        for record in rs:
+            key = record.key()
+            record.selected_special = key in self.selected_special
+            record.selected_thin_coal = key in self.selected_thin_coal
+
     def calculate(self):
         self.samples = []
         self.reviews = [
@@ -208,34 +223,50 @@ class SamplingEngine:
             r.coal_section = ""
             r.coal_group = ""
             r.sampled = False
+            r.selected_special = r.key() in self.selected_special
+            r.selected_thin_coal = r.key() in self.selected_thin_coal
+            if r.issue in {"DEPTH_GAP", "UNRESOLVED_OVERLAP"}:
+                r.sampled = True
 
         valid = [r for r in self.records if r.valid_depth and r.lithology]
+        self._apply_manual_selection(valid)
         self._check_geometry(valid)
-        self._hierarchy(valid)
-        self._thin_coal_specials(valid)
-        self._independent_layers(valid)
-        self._co_units(valid)
-        self._boards(valid)
+        self._identify_hierarchy(valid)
+        self._process_thin_coal(valid)
+        self._process_independent_layers(valid)
+        self._build_co_units(valid)
+        self._generate_board_samples(valid)
         self._normalize()
         self._make_reviews(valid)
+        self._finalize_overlap_guard()
 
     def _check_geometry(self, rs):
         covered = None
         for r in rs:
             if covered is not None:
                 if r.from_ > covered + self.params.eps:
+                    r.issue = "DEPTH_GAP"
                     self.reviews.append(self.review(r, "DEPTH_GAP"))
                 elif r.from_ < covered - self.params.eps:
+                    r.issue = "UNRESOLVED_OVERLAP"
                     self.reviews.append(self.review(r, "UNRESOLVED_OVERLAP"))
             covered = max(covered or r.to, r.to)
 
-    def _hierarchy(self, rs):
+    def _identify_hierarchy(self, rs):
         coal_layers = []
         current = []
         prev = None
         for r in rs:
+            if r.issue in {"DEPTH_GAP", "UNRESOLVED_OVERLAP"}:
+                if current:
+                    coal_layers.append(current)
+                    current = []
+                prev = r
+                continue
             if r.classification == "CO":
                 if prev is not None and abs(r.from_ - prev.to) > self.params.eps:
+                    if current:
+                        coal_layers.append(current)
                     current = []
                 current.append(r)
                 prev = r
@@ -252,11 +283,17 @@ class SamplingEngine:
             for r in layer:
                 r.coal_layer = layer_id
 
-        usable = {"CO", "THIN", "SPECIAL", "ORDINARY_THIN"}
         sections = []
         block = []
         prev = None
         for r in rs:
+            if r.issue in {"DEPTH_GAP", "UNRESOLVED_OVERLAP"}:
+                if any(x.classification == "CO" for x in block):
+                    sections.append(block)
+                block = []
+                prev = r
+                continue
+            usable = {"CO", "THIN", "SPECIAL", "ORDINARY_THIN"}
             contiguous = prev is not None and abs(r.from_ - prev.to) <= self.params.eps
             if r.classification in usable and contiguous:
                 block.append(r)
@@ -274,55 +311,72 @@ class SamplingEngine:
                 r.coal_section = section_id
 
         group_no = 0
-        end = None
+        last_end = None
         for section in sections:
-            start, stop = section[0].from_, section[-1].to
-            if end is None or start - end > self.params.group_gap_max:
+            start = section[0].from_
+            stop = section[-1].to
+            if last_end is None or start - last_end > self.params.group_gap_max:
                 group_no += 1
+            group_id = f"CG-{group_no:03d}"
             for r in section:
-                r.coal_group = f"CG-{group_no:03d}"
-            end = stop
+                r.coal_group = group_id
+            last_end = stop
 
-    def _thin_coal_specials(self, rs):
+    def _process_thin_coal(self, rs):
+        """Requirements 9.2 / 9.3 / 9.4.
+
+        Thin coal should be absorbed by adjacent special/THIN first. If no valid
+        adjacent special exists, it becomes a review candidate instead of silently
+        disappearing.
+        """
         for idx, r in enumerate(rs):
-            if not r.coal_layer or r.thickness >= self.params.coal_layer_no_sample_max:
+            if r.issue in {"DEPTH_GAP", "UNRESOLVED_OVERLAP"} or not r.coal_layer:
+                continue
+            if r.classification != "CO" or r.thickness >= self.params.coal_layer_no_sample_max:
                 continue
 
-            neighbours = []
-            if idx and rs[idx - 1].classification == "SPECIAL":
-                neighbours.append(rs[idx - 1])
-            if idx + 1 < len(rs) and rs[idx + 1].classification == "SPECIAL":
-                neighbours.append(rs[idx + 1])
-            if not neighbours:
+            prev = rs[idx - 1] if idx > 0 else None
+            nxt = rs[idx + 1] if idx + 1 < len(rs) else None
+            special_candidates = []
+            if prev and prev.lithology and prev.classification in {"SPECIAL", "THIN"}:
+                special_candidates.append(prev)
+            if nxt and nxt.lithology and nxt.classification in {"SPECIAL", "THIN"}:
+                special_candidates.append(nxt)
+
+            if not special_candidates:
                 self.reviews.append(self.review(r, "THIN_COAL_NO_ADJACENT_SPECIAL"))
                 continue
 
-            if len(neighbours) == 2 and neighbours[0].lithology == neighbours[1].lithology:
-                self.samples.append(
-                    self._sample(neighbours[0].from_, neighbours[1].to, neighbours[0].lithology, "特殊夹层样", r, [neighbours[0], r, neighbours[1]])
-                )
-                r.sampled = True
-                for item in neighbours:
-                    item.sampled = True
-                continue
+            # merge same-type special layers
+            same = []
+            if len(special_candidates) >= 2 and special_candidates[0].lithology == special_candidates[-1].lithology:
+                same = special_candidates
+            if same:
+                upper, lower = same[0], same[-1]
+                if upper.key() != lower.key():
+                    sample = self._sample(upper.from_, lower.to, upper.lithology, "特殊夹层样", r, [upper, r, lower])
+                    sample.comments = "10.0cm,CO"
+                    self.samples.append(sample)
+                    r.sampled = True
+                    upper.sampled = True
+                    lower.sampled = True
+                    for item in (upper, lower):
+                        item.sampled = True
+                    continue
 
-            target = neighbours[-1]
-            self.samples.append(
-                self._sample(
-                    r.from_ if target.from_ > r.from_ else target.from_,
-                    target.to if target.from_ > r.from_ else r.to,
-                    target.lithology,
-                    "特殊夹层样",
-                    r,
-                    [r, target],
-                )
-            )
+            target = special_candidates[-1]
+            start = min(r.from_, target.from_)
+            end = max(r.to, target.to)
+            sample = self._sample(start, end, target.lithology, "特殊夹层样", r, [r, target])
+            if target.classification == "THIN":
+                sample.comments = "10.0cm,CO"
+            self.samples.append(sample)
             r.sampled = True
             target.sampled = True
 
-    def _independent_layers(self, rs):
+    def _process_independent_layers(self, rs):
         for r in rs:
-            if r.sampled:
+            if r.sampled or r.issue in {"DEPTH_GAP", "UNRESOLVED_OVERLAP"}:
                 continue
             if r.classification == "SPECIAL" and r.thickness > self.params.thin_max:
                 self.samples.append(self._sample(r.from_, r.to, r.lithology, "特殊夹层样", r, [r]))
@@ -331,62 +385,80 @@ class SamplingEngine:
                 self.samples.append(self._sample(r.from_, r.to, r.lithology, "普通夹层样", r, [r]))
                 r.sampled = True
 
-    def _co_units(self, rs):
+    def _build_co_units(self, rs):
         unit = []
 
         def flush():
             nonlocal unit
             if unit:
-                self._split_co(unit)
+                self._split_co_unit(unit)
                 unit = []
 
         for idx, r in enumerate(rs):
-            accepted = r.classification == "CO" and not r.sampled
-            if r.classification == "THIN":
-                accepted = idx > 0 and idx + 1 < len(rs) and rs[idx - 1].classification == "CO" and rs[idx + 1].classification == "CO"
-            if accepted:
+            if r.issue in {"DEPTH_GAP", "UNRESOLVED_OVERLAP"}:
+                flush()
+                continue
+
+            selected_in_unit = r.selected_special or r.selected_thin_coal
+            is_co = r.classification == "CO" and not r.sampled
+            is_thin = (
+                r.classification == "THIN"
+                and idx > 0
+                and idx + 1 < len(rs)
+                and rs[idx - 1].classification == "CO"
+                and rs[idx + 1].classification == "CO"
+                and not r.sampled
+            )
+            if is_co or is_thin or selected_in_unit:
                 unit.append(r)
             else:
                 flush()
         flush()
 
-    def _split_co(self, unit):
+    def _split_co_unit(self, unit):
+        if not unit:
+            return
         total = unit[-1].to - unit[0].from_
         if total <= Decimal("1.5"):
             chunks = [unit]
         else:
             chunks = []
             start = 0
-            accumulated = Decimal(0)
-            thin = Decimal(0)
-            for idx, r in enumerate(unit):
-                if accumulated + r.thickness > self.params.coal_sample_max and idx > start:
+            segment_start = unit[0].from_
+            segment_end = segment_start + self.params.coal_sample_max
+            for idx, record in enumerate(unit):
+                if record.from_ >= segment_end and idx > start:
                     chunks.append(unit[start:idx])
                     start = idx
-                    accumulated = thin = Decimal(0)
-                accumulated += r.thickness
-                if r.classification == "THIN":
-                    thin += r.thickness
-                if thin > self.params.sample_thin_max and idx > start:
-                    chunks.append(unit[start:idx])
-                    start = idx
-                    accumulated = r.thickness
-                    thin = r.thickness if r.classification == "THIN" else Decimal(0)
+                    segment_start = record.from_
+                    segment_end = segment_start + self.params.coal_sample_max
+                if record.classification == "THIN" and idx > start:
+                    tail = sum((x.thickness for x in unit[start:idx+1] if x.classification == "THIN"), Decimal(0))
+                    if tail > self.params.sample_thin_max and idx + 1 < len(unit):
+                        chunks.append(unit[start:idx])
+                        start = idx
+                        segment_start = unit[idx].from_
+                        segment_end = segment_start + self.params.coal_sample_max
             if start < len(unit):
                 chunks.append(unit[start:])
 
         for chunk in chunks:
-            if chunk[-1].to - chunk[0].from_ <= 0:
+            if not chunk:
+                continue
+            if chunk[-1].to <= chunk[0].from_:
                 continue
             self.samples.append(self._sample(chunk[0].from_, chunk[-1].to, "CO", "煤样", chunk[0], chunk))
             for r in chunk:
                 r.sampled = True
 
     def _sample(self, fr, to, lith, typ, owner, parts):
-        extras = [
-            f"{int((r.thickness * 100).to_integral_value())}cm,{r.lithology}"
-            for r in parts if r.classification != "CO" and r is not owner
-        ]
+        extras = []
+        for r in parts:
+            if r.classification == "CO" or r is owner:
+                continue
+            if r.thickness <= Decimal(0):
+                continue
+            extras.append(f"{int((r.thickness * Decimal(100)).to_integral_value())}cm,{r.lithology}")
         return Sample(
             fr,
             to,
@@ -399,35 +471,37 @@ class SamplingEngine:
             [f"{r.source_sheet}:{r.source_row}" for r in parts],
         )
 
-    def _boards(self, rs):
+    def _generate_board_samples(self, rs):
         for group in sorted({r.coal_group for r in rs if r.coal_group}):
             members = [r for r in rs if r.coal_group == group]
             co_total = sum((r.thickness for r in members if r.classification == "CO"), Decimal(0))
             if co_total <= self.params.board_section_co_max:
                 continue
             first, last = members[0], members[-1]
-            self.samples.append(
-                Sample(
-                    max(Decimal(0), first.from_ - self.params.board_length),
-                    first.from_,
-                    "RF-" + first.lithology,
-                    "顶板样",
-                    group,
-                    first.coal_section,
-                    first.coal_layer,
+            if first.from_ > self.params.board_length:
+                self.samples.append(
+                    Sample(
+                        max(Decimal(0), first.from_ - self.params.board_length),
+                        first.from_,
+                        "RF-" + first.lithology,
+                        "顶板样",
+                        group,
+                        first.coal_section,
+                        first.coal_layer,
+                    )
                 )
-            )
-            self.samples.append(
-                Sample(
-                    last.to,
-                    last.to + self.params.board_length,
-                    "FL-" + last.lithology,
-                    "底板样",
-                    group,
-                    last.coal_section,
-                    last.coal_layer,
+            if last.to + self.params.board_length > last.to:
+                self.samples.append(
+                    Sample(
+                        last.to,
+                        last.to + self.params.board_length,
+                        "FL-" + last.lithology,
+                        "底板样",
+                        group,
+                        last.coal_section,
+                        last.coal_layer,
+                    )
                 )
-            )
 
     def _normalize(self):
         self.samples = [s for s in self.samples if s.to > s.from_]
@@ -447,13 +521,24 @@ class SamplingEngine:
                 merged[-1].sources.extend(s.sources)
             else:
                 merged.append(s)
-
         self.samples = merged
         for index, s in enumerate(self.samples, 1):
             s.sample_no = f"S{index:04d}"
 
+    def _finalize_overlap_guard(self):
+        """Final guard: the result cannot contain overlapping samples."""
+        ordered = sorted(self.samples, key=lambda s: (s.from_, s.to))
+        previous = None
+        for current in ordered:
+            if previous is not None and current.from_ < previous.to - self.params.eps:
+                current.comments = (current.comments + "; " if current.comments else "") + "OVERLAP_CHECK"
+                previous.comments = (previous.comments + "; " if previous.comments else "") + "OVERLAP_CHECK"
+            previous = current
+
     def _make_reviews(self, rs):
         for r in rs:
+            if r.issue in {"DEPTH_GAP", "UNRESOLVED_OVERLAP"}:
+                continue
             if r.classification == "SPECIAL" and not r.sampled:
                 self.reviews.append(self.review(r, "SPECIAL_NOT_SAMPLED"))
             if r.coal_layer and r.thickness < self.params.coal_layer_no_sample_max and not r.sampled:
